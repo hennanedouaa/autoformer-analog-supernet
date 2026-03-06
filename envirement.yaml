@@ -1,0 +1,19 @@
+name: analog-autoformer-supernet
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - aihwkit=1.1.0
+  - pytorch
+  - torchvision
+  - torchaudio
+  - numpy
+  - pyyaml
+  - tqdm
+  - matplotlib
+  - scipy
+  - pip:
+      - timm
+      - opencv-python
+      - einops
