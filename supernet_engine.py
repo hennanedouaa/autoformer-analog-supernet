@@ -191,41 +191,87 @@ class FairSampler:
         return embed_dim, mlp_ratio, num_heads
 
 
-def train_one_epoch(model, loader, optimizer, criterion, sampler, device, clip_grad=1.0):
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    scheduler,
+    criterion,
+    sampler,
+    device,
+    clip_grad=1.0
+):
     model.train()
+
     running_loss = 0.0
     correct = 0
     total = 0
-    loop = tqdm(loader, desc="Training")
-    for images, labels in loop:
-        images, labels = images.to(device), labels.to(device)
 
+    loop = tqdm(loader, desc="Training")
+
+    for images, labels in loop:
+
+        images = images.to(device)
+        labels = labels.to(device)
+
+        # -------------------------
         # Sample subnet
+        # -------------------------
         embed_dim, mlp_ratio, num_heads = sampler.sample_subnet()
+
         config_dict = {
-            'layer_num': sampler.L,
-            'embed_dim': embed_dim,
-            'mlp_ratio': mlp_ratio,
+            "layer_num": sampler.L,
+            "embed_dim": embed_dim,
+            "mlp_ratio": mlp_ratio,
         }
+
         if sampler.change_qkv:
-            config_dict['num_heads'] = num_heads
+            config_dict["num_heads"] = num_heads
+
         model.set_sample_config(config_dict)
 
+        # -------------------------
+        # Forward
+        # -------------------------
         optimizer.zero_grad()
+
         outputs = model(images)
+
         loss = criterion(outputs, labels)
+
+        # -------------------------
+        # Backward
+        # -------------------------
         loss.backward()
+
         if clip_grad > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+
         optimizer.step()
 
+        # -------------------------
+        # Cosine scheduler step
+        # -------------------------
+        scheduler.step()
+
+        # -------------------------
+        # Metrics
+        # -------------------------
         running_loss += loss.item() * images.size(0)
+
         _, predicted = outputs.max(1)
+
         total += labels.size(0)
+
         correct += predicted.eq(labels).sum().item()
 
-        loop.set_postfix(loss=loss.item(), acc=100.*correct/total)
+        loop.set_postfix(
+            loss=loss.item(),
+            acc=100. * correct / total,
+            lr=optimizer.param_groups[0]["lr"]
+        )
 
     epoch_loss = running_loss / total
     epoch_acc = 100. * correct / total
+
     return epoch_loss, epoch_acc

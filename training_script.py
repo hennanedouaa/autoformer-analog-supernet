@@ -201,7 +201,7 @@ def main():
     
     # Set device
     args.device = "cuda" if torch.cuda.is_available() else "cpu"
-    
+    EPOCHS = args.epochs
     # ------------------------
     # Create Digital Model and Load Pretrained Weights
     # ------------------------
@@ -254,7 +254,7 @@ def main():
         mlp_ratio=cfg.SUPERNET.MLP_RATIO,
         qkv_bias=True,
         drop_rate=args.drop,
-        drop_path_rate=args.drop_path,
+        drop_path_rate=0.05, #made it smaller 
         gp=args.gp,
         relative_position=args.relative_position,
         change_qkv=args.change_qkv,
@@ -334,26 +334,42 @@ def main():
     # ------------------------
     # Optimizer and Loss
     # ------------------------
+    param_groups = get_param_groups(analog_model, weight_decay=0.01)
+
     optimizer = AnalogAdam(
-        analog_model.parameters(),
-        lr=3e-5,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        weight_decay=0.05,
-    )
+      param_groups,
+      lr=2e-5,
+      betas=(0.9, 0.999),
+      eps=1e-8,
+      )
+
     optimizer.regroup_param_groups(analog_model)
     criterion = nn.CrossEntropyLoss()
-    
+
+    total_steps = len(train_loader) * EPOCHS
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer,
+    T_max=total_steps,
+    eta_min=1e-6
+     )
     # ------------------------
     # Training Loop
     # ------------------------
-    EPOCHS = args.epochs
+    
     print("\nStarting hardware‑aware fine‑tuning...")
     for epoch in range(EPOCHS):
-        train_loss, train_acc = train_one_epoch(
-            analog_model, train_loader, optimizer, criterion, sampler,
-            device=args.device, clip_grad=1.0
-        )
+
+        train_loss, train_acc, global_step = train_one_epoch(
+        analog_model,
+        train_loader,
+        optimizer,
+        scheduler,
+        criterion,
+        sampler,
+        device=args.device,
+        clip_grad=1.0
+         )
         print(f"Epoch {epoch+1}: Train Loss {train_loss:.4f}, Train Acc {train_acc:.2f}%")
         
         # Validation
@@ -374,6 +390,27 @@ def main():
     save_path = Path(args.output_dir) / "analog_supernet_finetuned.pth"
     torch.save(analog_model.state_dict(), save_path)
     print(f"Fine‑tuning finished. Model saved to {save_path}")
+def get_param_groups(model, weight_decay=0.01):
+    decay = []
+    no_decay = []
 
+    for name, param in model.named_parameters():
+
+        if not param.requires_grad:
+            continue
+
+        if (
+            name.endswith(".bias")
+            or "norm" in name.lower()
+            or "layernorm" in name.lower()
+        ):
+            no_decay.append(param)
+        else:
+            decay.append(param)
+
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
 if __name__ == "__main__":
     main()
