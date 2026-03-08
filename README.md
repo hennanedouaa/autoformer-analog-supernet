@@ -7,7 +7,7 @@ conda env create -f environment.yaml
 conda activate analog-autoformer-supernet
 ```
 
-2-To tun training script:   
+2-To run training script:   
 for tiny:   
 ```buildoutcfg
 python  training_script.py \
@@ -20,3 +20,4 @@ python  training_script.py \
   --output_dir ./analog-ckpts \
   --gp --change_qkv --relative_position
 ```
+
