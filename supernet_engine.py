@@ -4,189 +4,227 @@ supernet_engine.py
 Utilities for initializing an analog AutoFormer supernet from a digital one.
 """
 
+import random
 import torch
 import torch.nn as nn
-import random
 from tqdm import tqdm
+
 
 def initialize_analog_supernet(digital_model, analog_model, verbose=True):
     """
     Copy all weights from a digital AutoFormer supernet to an analog AutoFormer supernet.
+
+    IMPORTANT:
+    - This should be called while BOTH models are still on CPU.
+    - Move the analog model to CUDA only AFTER this function finishes.
     """
-    # Put both models in eval mode to disable dropout/stochastic depth
+
+    def log(msg):
+        if verbose:
+            print(msg, flush=True)
+
     digital_model.eval()
     analog_model.eval()
 
-    if verbose:
-        print("=" * 60)
-        print("Copying ALL weights from digital to analog supernet")
-        print("=" * 60)
+    with torch.no_grad():
+        log("=" * 60)
+        log("Copying ALL weights from digital to analog supernet")
+        log("=" * 60)
 
-    # 1. Patch embedding (special case – not a linear super)
-    digital_patch_conv = digital_model.patch_embed_super.proj
-    analog_model.patch_embed_super.copy_from_digital_conv(digital_patch_conv)
-    if verbose:
-        print("Patch embedding copied (all embed dims).")
+        # ------------------------------------------------------------------
+        # 1. Patch embedding
+        # ------------------------------------------------------------------
+        log("STEP 1: patch embedding...")
+        digital_patch_conv = digital_model.patch_embed_super.proj
+        analog_model.patch_embed_super.copy_from_digital_conv(digital_patch_conv)
+        log("DONE 1: patch embedding copied.")
 
-    # 2. Positional embeddings (direct copy)
-    analog_model.cls_token.data.copy_(digital_model.cls_token.data)
-    if verbose:
-        print("cls_token copied.")
-    if analog_model.abs_pos:
-        analog_model.pos_embed.data.copy_(digital_model.pos_embed.data)
-        if verbose:
-            print("pos_embed copied.")
+        # ------------------------------------------------------------------
+        # 2. cls_token and positional embeddings
+        # ------------------------------------------------------------------
+        log("STEP 2: cls_token...")
+        analog_model.cls_token.copy_(digital_model.cls_token)
+        log("DONE 2: cls_token copied.")
 
-    # 3. Transformer blocks
-    for i, (digital_blk, analog_blk) in enumerate(zip(digital_model.blocks, analog_model.blocks)):
-        if verbose:
-            print(f"\n  Processing block {i}...")
-
-        # LayerNorms (direct tensor copy)
-        analog_blk.attn_layer_norm.weight.data.copy_(digital_blk.attn_layer_norm.weight.data)
-        analog_blk.attn_layer_norm.bias.data.copy_(digital_blk.attn_layer_norm.bias.data)
-        analog_blk.ffn_layer_norm.weight.data.copy_(digital_blk.ffn_layer_norm.weight.data)
-        analog_blk.ffn_layer_norm.bias.data.copy_(digital_blk.ffn_layer_norm.bias.data)
-        if verbose:
-            print("    LayerNorms copied.")
-
-        # Attention QKV (uses special handling inside copy_all_ops_from_digital)
-        analog_blk.attn.qkv.copy_all_ops_from_digital(digital_blk.attn.qkv)
-        if verbose:
-            print("    attn.qkv: all ops copied.")
-
-        # Attention projection
-        analog_blk.attn.proj.copy_all_ops_from_digital(digital_blk.attn.proj)
-        if verbose:
-            print("    attn.proj: all ops copied.")
-
-        # MLP fc1
-        analog_blk.fc1.copy_all_ops_from_digital(digital_blk.fc1)
-        if verbose:
-            print("    fc1: all ops copied.")
-
-        # MLP fc2
-        analog_blk.fc2.copy_all_ops_from_digital(digital_blk.fc2)
-        if verbose:
-            print("    fc2: all ops copied.")
-
-        # Relative position embeddings (if used)
-        if hasattr(digital_blk.attn, 'rel_pos_embed_k') and hasattr(analog_blk.attn, 'rel_pos_embed_k'):
-            analog_blk.attn.rel_pos_embed_k.embeddings_table_v.data.copy_(
-                digital_blk.attn.rel_pos_embed_k.embeddings_table_v.data)
-            analog_blk.attn.rel_pos_embed_k.embeddings_table_h.data.copy_(
-                digital_blk.attn.rel_pos_embed_k.embeddings_table_h.data)
-            analog_blk.attn.rel_pos_embed_v.embeddings_table_v.data.copy_(
-                digital_blk.attn.rel_pos_embed_v.embeddings_table_v.data)
-            analog_blk.attn.rel_pos_embed_v.embeddings_table_h.data.copy_(
-                digital_blk.attn.rel_pos_embed_v.embeddings_table_h.data)
-            if verbose:
-                print("    Relative position embeddings copied.")
-
-    # 4. Final layer norm
-    if hasattr(digital_model, 'norm') and digital_model.norm is not None:
-        analog_model.norm.weight.data.copy_(digital_model.norm.weight.data)
-        analog_model.norm.bias.data.copy_(digital_model.norm.bias.data)
-        if verbose:
-            print("\nFinal norm copied.")
-
-    # 5. Head classifier
-    if isinstance(analog_model.head, nn.Module) and not isinstance(analog_model.head, nn.Identity):
-        if hasattr(analog_model.head, 'copy_all_ops_from_digital'):
-            analog_model.head.copy_all_ops_from_digital(digital_model.head)
-            if verbose:
-                print("Head: all ops copied.")
+        if getattr(analog_model, "abs_pos", False):
+            log("STEP 3: pos_embed...")
+            analog_model.pos_embed.copy_(digital_model.pos_embed)
+            log("DONE 3: pos_embed copied.")
         else:
-            # Fallback (shouldn't happen for AnalogLinearSuper)
-            analog_model.head.weight.data.copy_(digital_model.head.weight.data)
-            if digital_model.head.bias is not None:
-                analog_model.head.bias.data.copy_(digital_model.head.bias.data)
-            if verbose:
-                print("Head copied (direct).")
-    else:
-        if verbose:
-            print("Head is identity, skipping.")
+            log("STEP 3: pos_embed skipped (abs_pos=False).")
 
-    if verbose:
-        print("\n" + "=" * 60)
-        print("All analog operators initialized from digital model.")
-        print("=" * 60)
+        # ------------------------------------------------------------------
+        # 3. Transformer blocks
+        # ------------------------------------------------------------------
+        log("STEP 4: transformer blocks...")
+        for i, (digital_blk, analog_blk) in enumerate(zip(digital_model.blocks, analog_model.blocks)):
+            log(f"\nBLOCK {i}: start")
+
+            # LayerNorms
+            log(f"BLOCK {i}: attn_layer_norm...")
+            analog_blk.attn_layer_norm.weight.copy_(digital_blk.attn_layer_norm.weight)
+            analog_blk.attn_layer_norm.bias.copy_(digital_blk.attn_layer_norm.bias)
+
+            log(f"BLOCK {i}: ffn_layer_norm...")
+            analog_blk.ffn_layer_norm.weight.copy_(digital_blk.ffn_layer_norm.weight)
+            analog_blk.ffn_layer_norm.bias.copy_(digital_blk.ffn_layer_norm.bias)
+            log(f"BLOCK {i}: LayerNorms copied.")
+
+            # Attention QKV
+            log(f"BLOCK {i}: attn.qkv...")
+            analog_blk.attn.qkv.copy_all_ops_from_digital(digital_blk.attn.qkv)
+            log(f"BLOCK {i}: attn.qkv copied.")
+
+            # Attention projection
+            log(f"BLOCK {i}: attn.proj...")
+            analog_blk.attn.proj.copy_all_ops_from_digital(digital_blk.attn.proj)
+            log(f"BLOCK {i}: attn.proj copied.")
+
+            # MLP fc1
+            log(f"BLOCK {i}: fc1...")
+            analog_blk.fc1.copy_all_ops_from_digital(digital_blk.fc1)
+            log(f"BLOCK {i}: fc1 copied.")
+
+            # MLP fc2
+            log(f"BLOCK {i}: fc2...")
+            analog_blk.fc2.copy_all_ops_from_digital(digital_blk.fc2)
+            log(f"BLOCK {i}: fc2 copied.")
+
+            # Relative position embeddings
+            has_rel_k = hasattr(digital_blk.attn, "rel_pos_embed_k") and hasattr(analog_blk.attn, "rel_pos_embed_k")
+            has_rel_v = hasattr(digital_blk.attn, "rel_pos_embed_v") and hasattr(analog_blk.attn, "rel_pos_embed_v")
+
+            if has_rel_k and has_rel_v:
+                log(f"BLOCK {i}: relative position embeddings...")
+                analog_blk.attn.rel_pos_embed_k.embeddings_table_v.copy_(
+                    digital_blk.attn.rel_pos_embed_k.embeddings_table_v
+                )
+                analog_blk.attn.rel_pos_embed_k.embeddings_table_h.copy_(
+                    digital_blk.attn.rel_pos_embed_k.embeddings_table_h
+                )
+                analog_blk.attn.rel_pos_embed_v.embeddings_table_v.copy_(
+                    digital_blk.attn.rel_pos_embed_v.embeddings_table_v
+                )
+                analog_blk.attn.rel_pos_embed_v.embeddings_table_h.copy_(
+                    digital_blk.attn.rel_pos_embed_v.embeddings_table_h
+                )
+                log(f"BLOCK {i}: relative position embeddings copied.")
+            else:
+                log(f"BLOCK {i}: relative position embeddings skipped.")
+
+            log(f"BLOCK {i}: done")
+
+        # ------------------------------------------------------------------
+        # 4. Final norm
+        # ------------------------------------------------------------------
+        if hasattr(digital_model, "norm") and digital_model.norm is not None:
+            log("\nSTEP 5: final norm...")
+            analog_model.norm.weight.copy_(digital_model.norm.weight)
+            analog_model.norm.bias.copy_(digital_model.norm.bias)
+            log("DONE 5: final norm copied.")
+        else:
+            log("\nSTEP 5: final norm skipped.")
+
+        # ------------------------------------------------------------------
+        # 5. Head classifier
+        # ------------------------------------------------------------------
+        log("STEP 6: head...")
+        if isinstance(analog_model.head, nn.Module) and not isinstance(analog_model.head, nn.Identity):
+            if hasattr(analog_model.head, "copy_all_ops_from_digital"):
+                analog_model.head.copy_all_ops_from_digital(digital_model.head)
+                log("DONE 6: head copied with copy_all_ops_from_digital.")
+            else:
+                analog_model.head.weight.copy_(digital_model.head.weight)
+                if getattr(digital_model.head, "bias", None) is not None:
+                    analog_model.head.bias.copy_(digital_model.head.bias)
+                log("DONE 6: head copied directly.")
+        else:
+            log("STEP 6: head skipped (Identity).")
+
+        log("\n" + "=" * 60)
+        log("All analog operators initialized from digital model.")
+        log("=" * 60)
 
 
 class FairSampler:
     """
-    Round‑robin sampler that guarantees exact fairness over a cycle of 16 batches.
-    
+    Round-robin sampler that guarantees exact fairness over one cycle.
+
     For each cycle:
-        - The 4 embedding dimensions are taken in a random order, each used for 4 consecutive batches.
-        - For each block, a random permutation of the 4 (r, h) pairs is created for each embedding dimension.
-        - The (r, h) for a block in a batch is the next element from the permutation corresponding to the current d.
-    After 16 batches, every block has seen every combination (d, r, h) exactly once.
-    At the end of the cycle, the order of d values and each block's per‑d permutations are reshuffled.
+        - Embedding dimensions are shuffled and each repeated len(rh_combos) times.
+        - For each block and each embedding dimension, a shuffled permutation of
+          the available (r, h) combinations is created.
+        - Over a full cycle, each block sees every combination exactly once.
     """
 
     def __init__(self, L, change_qkv, embed_choices, mlp_ratio_choices, num_heads_choices):
         self.L = L
         self.change_qkv = change_qkv
-        self.embed_choices = embed_choices
+        self.embed_choices = list(embed_choices)
 
-        # Prepare (r, h) combos
-        if change_qkv:
-            self.rh_combos = [(r, h) for r in mlp_ratio_choices for h in num_heads_choices]  # 4 combos
+        if self.change_qkv:
+            self.rh_combos = [(r, h) for r in mlp_ratio_choices for h in num_heads_choices]
         else:
-            self.rh_combos = [(r,) for r in mlp_ratio_choices]  # 2 combos
+            self.rh_combos = [(r,) for r in mlp_ratio_choices]
 
-        # Generate the first cycle
+        self.step = 0
         self._new_cycle()
 
-        # Pointers for current position in the cycle
-        self.step = 0
-
     def _new_cycle(self):
-        """Create a new cycle of 16 batches with guaranteed fairness."""
-        # Random order of the 4 embedding dimensions, each repeated 4 times
+        """
+        Create a fresh cycle with exact fairness.
+        Cycle length = len(embed_choices) * len(rh_combos)
+        """
+        combos_per_d = len(self.rh_combos)
+
         d_order = self.embed_choices.copy()
         random.shuffle(d_order)
+
         self.d_cycle = []
         for d in d_order:
-            self.d_cycle.extend([d] * 4)
+            self.d_cycle.extend([d] * combos_per_d)
 
-        # For each block, build a list of 16 (r, h) values that pairs with the d_cycle
-        self.rh_cycles = []  # list of lists, one per block
-        for b in range(self.L):
-            # For each d, create a shuffled permutation of the 4 (r,h) combos
+        self.rh_cycles = []
+        for _ in range(self.L):
             perms = {}
             for d in self.embed_choices:
                 perm = self.rh_combos.copy()
                 random.shuffle(perm)
                 perms[d] = perm
-            # Build the cycle by concatenating the permutations in the order of d_cycle
+
+            used_count = {d: 0 for d in self.embed_choices}
             rh_cycle = []
+
             for d in self.d_cycle:
-                # pop from the front to avoid reuse
-                rh_cycle.append(perms[d].pop(0))
+                idx = used_count[d]
+                rh_cycle.append(perms[d][idx])
+                used_count[d] += 1
+
             self.rh_cycles.append(rh_cycle)
 
+        self.step = 0
+
     def sample_subnet(self):
-        """Return (embed_dim, mlp_ratio, num_heads) for the next batch."""
-        # Get current values from the cycle
+        """
+        Return (embed_dim, mlp_ratio, num_heads) for the next batch.
+        """
         d = self.d_cycle[self.step]
         embed_dim = [d] * self.L
         mlp_ratio = []
         num_heads = []
+
         for b in range(self.L):
             if self.change_qkv:
                 r, h = self.rh_cycles[b][self.step]
+                mlp_ratio.append(r)
                 num_heads.append(h)
             else:
                 r = self.rh_cycles[b][self.step][0]
-            mlp_ratio.append(r)
+                mlp_ratio.append(r)
 
-        # Advance step
         self.step += 1
         if self.step == len(self.d_cycle):
-            self.step = 0
-            self._new_cycle()  # start a new cycle with reshuffled orders
+            self._new_cycle()
 
         return embed_dim, mlp_ratio, num_heads
 
@@ -210,9 +248,8 @@ def train_one_epoch(
     loop = tqdm(loader, desc="Training")
 
     for images, labels in loop:
-
-        images = images.to(device)
-        labels = labels.to(device)
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
         # -------------------------
         # Sample subnet
@@ -233,10 +270,8 @@ def train_one_epoch(
         # -------------------------
         # Forward
         # -------------------------
-        optimizer.zero_grad()
-
+        optimizer.zero_grad(set_to_none=True)
         outputs = model(images)
-
         loss = criterion(outputs, labels)
 
         # -------------------------
@@ -244,34 +279,34 @@ def train_one_epoch(
         # -------------------------
         loss.backward()
 
-        if clip_grad > 0:
+        if clip_grad is not None and clip_grad > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
 
         optimizer.step()
 
         # -------------------------
-        # Cosine scheduler step
+        # Scheduler step
         # -------------------------
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
 
         # -------------------------
         # Metrics
         # -------------------------
-        running_loss += loss.item() * images.size(0)
+        batch_size = images.size(0)
+        running_loss += loss.item() * batch_size
 
         _, predicted = outputs.max(1)
-
         total += labels.size(0)
-
         correct += predicted.eq(labels).sum().item()
 
         loop.set_postfix(
-            loss=loss.item(),
-            acc=100. * correct / total,
+            loss=float(loss.item()),
+            acc=100.0 * correct / max(total, 1),
             lr=optimizer.param_groups[0]["lr"]
         )
 
-    epoch_loss = running_loss / total
-    epoch_acc = 100. * correct / total
+    epoch_loss = running_loss / max(total, 1)
+    epoch_acc = 100.0 * correct / max(total, 1)
 
     return epoch_loss, epoch_acc
