@@ -1,6 +1,7 @@
 # ----------------------------------------------------------------------
 # Full Hardware-Aware Fine-Tuning Script with Fair Sampling
 # Safe analog initialization version
+# Modified to support BALANCED DEPTH SAMPLING
 # ----------------------------------------------------------------------
 """
 To execute it:
@@ -16,7 +17,6 @@ python training_script.py \
     --gp --change_qkv --relative_position
 """
 
-import argparse
 import inspect
 import random
 from pathlib import Path
@@ -25,7 +25,6 @@ import torch
 import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 # AutoFormer imports
 from AutoFormer.lib.config import cfg, update_config_from_file
@@ -193,99 +192,162 @@ def initialize_analog_supernet_safe(digital_model, analog_model, verbose=True):
 
 
 # ----------------------------------------------------------------------
-# Fairness test: operator counts over one cycle
+# Fairness tests adapted for BALANCED DEPTH SAMPLING
 # ----------------------------------------------------------------------
+def test_depth_fairness(sampler, verbose=True):
+    """
+    Over one cycle, each depth should appear exactly:
+        len(embed_choices) * len(rh_combos)
+    times.
+    """
+    cycle_len = len(sampler.depth_embed_cycle)
+    counts = {int(L): 0 for L in sampler.depth_choices}
+
+    for _ in range(cycle_len):
+        layer_num, _, _, _ = sampler.sample_subnet()
+        counts[int(layer_num)] += 1
+
+    expected = len(sampler.embed_choices) * len(sampler.rh_combos)
+    all_ok = True
+
+    for L in sorted(counts.keys()):
+        cnt = counts[L]
+        if cnt != expected:
+            print(f"❌ depth {L}: count={cnt}, expected={expected}", flush=True)
+            all_ok = False
+        elif verbose:
+            print(f"✅ depth {L}: count={cnt}", flush=True)
+
+    if all_ok:
+        print("\n✅ Depth fairness test passed.", flush=True)
+    else:
+        print("\n⚠️ Depth fairness test failed.", flush=True)
+
+    return all_ok
+
+
 def test_operator_counts(sampler, verbose=True):
     """
     Simulate one full cycle and count how many times each operator
-    (fc1, fc2, qkv, proj) is used in each block.
+    (fc1, fc2, qkv, proj) is used in each ACTIVE block.
+
+    Important:
+    - fc1/fc2 keys collapse over head choice, so their expected count is
+      active_depth_count * num_head_choices
+    - qkv/proj keys collapse over mlp ratio choice, so their expected count is
+      active_depth_count * num_mlp_ratio_choices
     """
-    cycle_len = len(sampler.d_cycle)
+    cycle_len = len(sampler.depth_embed_cycle)
+
     counts = {
         b: {
-            'fc1': {},
-            'fc2': {},
-            'qkv': {},
-            'proj': {}
-        } for b in range(sampler.L)
+            "fc1": {},
+            "fc2": {},
+            "qkv": {},
+            "proj": {}
+        } for b in range(sampler.max_L)
     }
 
-    for step in range(cycle_len):
-        embed_dim, mlp_ratio, num_heads = sampler.sample_subnet()
+    num_mlp = len(set(x[0] for x in sampler.rh_combos))
+    num_heads = len(set(x[1] for x in sampler.rh_combos)) if sampler.change_qkv else 1
+
+    for _ in range(cycle_len):
+        layer_num, embed_dim, mlp_ratio, num_heads_list = sampler.sample_subnet()
         d = embed_dim[0]
 
-        for b in range(sampler.L):
+        for b in range(layer_num):
             r = mlp_ratio[b]
-            h = num_heads[b] if sampler.change_qkv else None
+            h = num_heads_list[b] if sampler.change_qkv else None
             d_q = h * 64 if sampler.change_qkv else d
 
             fc1_key = f"in{d}_out{int(d * r)}"
-            counts[b]['fc1'][fc1_key] = counts[b]['fc1'].get(fc1_key, 0) + 1
+            counts[b]["fc1"][fc1_key] = counts[b]["fc1"].get(fc1_key, 0) + 1
 
             fc2_key = f"in{int(d * r)}_out{d}"
-            counts[b]['fc2'][fc2_key] = counts[b]['fc2'].get(fc2_key, 0) + 1
+            counts[b]["fc2"][fc2_key] = counts[b]["fc2"].get(fc2_key, 0) + 1
 
             qkv_key = f"in{d}_out{3 * d_q}"
-            counts[b]['qkv'][qkv_key] = counts[b]['qkv'].get(qkv_key, 0) + 1
+            counts[b]["qkv"][qkv_key] = counts[b]["qkv"].get(qkv_key, 0) + 1
 
             proj_key = f"in{d_q}_out{d}"
-            counts[b]['proj'][proj_key] = counts[b]['proj'].get(proj_key, 0) + 1
+            counts[b]["proj"][proj_key] = counts[b]["proj"].get(proj_key, 0) + 1
 
     all_ok = True
-    for b in range(sampler.L):
+    for b in range(sampler.max_L):
+        active_depth_count = sum(1 for L in sampler.depth_choices if L > b)
+
+        expected_fc = active_depth_count * num_heads
+        expected_qkv = active_depth_count * num_mlp
+
         if verbose:
             print(f"\nBlock {b}:", flush=True)
-        for role in ['fc1', 'fc2', 'qkv', 'proj']:
+
+        for role in ["fc1", "fc2"]:
             op_counts = counts[b][role]
-            bad = [k for k, cnt in op_counts.items() if cnt != 2]
+            bad = [k for k, cnt in op_counts.items() if cnt != expected_fc]
             if bad:
-                print(f"  ❌ {role}: {len(bad)} operators have count != 2: {bad}", flush=True)
+                print(f"  ❌ {role}: {len(bad)} operators have count != {expected_fc}: {bad}", flush=True)
                 all_ok = False
-            else:
-                if verbose:
-                    print(f"  ✅ {role}: all {len(op_counts)} operators appear exactly twice", flush=True)
+            elif verbose:
+                print(f"  ✅ {role}: all {len(op_counts)} operators appear exactly {expected_fc} times", flush=True)
+
+        for role in ["qkv", "proj"]:
+            op_counts = counts[b][role]
+            bad = [k for k, cnt in op_counts.items() if cnt != expected_qkv]
+            if bad:
+                print(f"  ❌ {role}: {len(bad)} operators have count != {expected_qkv}: {bad}", flush=True)
+                all_ok = False
+            elif verbose:
+                print(f"  ✅ {role}: all {len(op_counts)} operators appear exactly {expected_qkv} times", flush=True)
 
     if all_ok:
-        print("\n✅ Operator count test passed: each operator used exactly twice in one cycle.", flush=True)
+        print("\n✅ Operator count test passed.", flush=True)
     else:
         print("\n⚠️ Operator count test failed.", flush=True)
 
     return all_ok
 
 
-# ----------------------------------------------------------------------
-# Fairness test: short exact cycle
-# ----------------------------------------------------------------------
 def test_sampler_short(sampler, verbose=True):
-    cycle_len = len(sampler.d_cycle)
-    counts = {b: {} for b in range(sampler.L)}
+    """
+    For each active block b, over one full cycle:
+    each (depth, embed_dim, mlp_ratio, num_heads) combo that activates block b
+    should appear exactly once.
+    """
+    cycle_len = len(sampler.depth_embed_cycle)
+    counts = {b: {} for b in range(sampler.max_L)}
 
     for _ in range(cycle_len):
-        embed_dim, mlp_ratio, num_heads = sampler.sample_subnet()
+        layer_num, embed_dim, mlp_ratio, num_heads = sampler.sample_subnet()
         d = embed_dim[0]
-        for b in range(sampler.L):
+
+        for b in range(layer_num):
             if sampler.change_qkv:
-                key = (d, mlp_ratio[b], num_heads[b])
+                key = (layer_num, d, mlp_ratio[b], num_heads[b])
             else:
-                key = (d, mlp_ratio[b])
+                key = (layer_num, d, mlp_ratio[b])
+
             counts[b][key] = counts[b].get(key, 0) + 1
 
-    total_combos = len(sampler.embed_choices) * len(sampler.rh_combos)
     all_ok = True
 
-    for b in range(sampler.L):
-        if len(counts[b]) != total_combos:
+    for b in range(sampler.max_L):
+        active_depths = [L for L in sampler.depth_choices if L > b]
+        total_expected = len(active_depths) * len(sampler.embed_choices) * len(sampler.rh_combos)
+
+        if len(counts[b]) != total_expected:
             if verbose:
-                print(f"Block {b}: {len(counts[b])} distinct combos out of {total_combos}", flush=True)
+                print(f"Block {b}: {len(counts[b])} distinct combos out of {total_expected}", flush=True)
             all_ok = False
         else:
-            if any(cnt > 1 for cnt in counts[b].values()):
+            repeated = any(cnt > 1 for cnt in counts[b].values())
+            if repeated:
                 if verbose:
                     print(f"Block {b}: some combos appear multiple times", flush=True)
                 all_ok = False
             else:
                 if verbose:
-                    print(f"Block {b}: all combos appear exactly once", flush=True)
+                    print(f"Block {b}: all active combos appear exactly once", flush=True)
 
     if all_ok:
         print("✅ Short fairness test passed!", flush=True)
@@ -295,34 +357,46 @@ def test_sampler_short(sampler, verbose=True):
     return all_ok
 
 
-# ----------------------------------------------------------------------
-# Long-term fairness test
-# ----------------------------------------------------------------------
 def test_sampler_long(sampler, num_steps=10000, tolerance=0.05, verbose=True):
-    d_count = len(sampler.embed_choices)
-    rh_count = len(sampler.rh_combos)
-    total_combos = d_count * rh_count
-    expected = num_steps / total_combos
+    """
+    Long-run approximate fairness test.
+
+    For each active block b, we count keys:
+        (depth, embed_dim, mlp_ratio, num_heads)
+    among configs where block b is active.
+
+    Since each active key appears once per full global cycle,
+    the expected count is:
+        num_steps / len(sampler.depth_embed_cycle)
+    """
+    counts = {b: {} for b in range(sampler.max_L)}
+    all_ok = True
+
+    cycle_len = len(sampler.depth_embed_cycle)
+    expected = num_steps / cycle_len
     lower = expected * (1 - tolerance)
     upper = expected * (1 + tolerance)
 
-    counts = {b: {} for b in range(sampler.L)}
-
     for _ in range(num_steps):
-        embed_dim, mlp_ratio, num_heads = sampler.sample_subnet()
+        layer_num, embed_dim, mlp_ratio, num_heads = sampler.sample_subnet()
         d = embed_dim[0]
-        for b in range(sampler.L):
+
+        for b in range(layer_num):
             if sampler.change_qkv:
-                key = (d, mlp_ratio[b], num_heads[b])
+                key = (layer_num, d, mlp_ratio[b], num_heads[b])
             else:
-                key = (d, mlp_ratio[b])
+                key = (layer_num, d, mlp_ratio[b])
+
             counts[b][key] = counts[b].get(key, 0) + 1
 
-    all_ok = True
-    for b in range(sampler.L):
+    for b in range(sampler.max_L):
+        active_depths = [L for L in sampler.depth_choices if L > b]
+        total_keys = len(active_depths) * len(sampler.embed_choices) * len(sampler.rh_combos)
+
         block_counts = list(counts[b].values())
-        if len(block_counts) != total_combos:
-            print(f"Block {b}: only {len(block_counts)} combos out of {total_combos} seen", flush=True)
+
+        if len(block_counts) != total_keys:
+            print(f"Block {b}: only {len(block_counts)} combos out of {total_keys} seen", flush=True)
             all_ok = False
             continue
 
@@ -380,6 +454,11 @@ def main():
     args.device = "cuda" if torch.cuda.is_available() else "cpu"
     EPOCHS = args.epochs
 
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     # ------------------------
     # Create Digital Model
     # ------------------------
@@ -422,7 +501,6 @@ def main():
 
     rpu_config = gen_rpu_config()
 
-    # IMPORTANT: keep analog model on CPU during initialization
     analog_model = AnalogVision_TransformerSuper(
         super_config=SUPER_CONFIG,
         rpu_config=rpu_config,
@@ -447,12 +525,9 @@ def main():
     if digital_state_dict is None:
         raise FileNotFoundError(f"Digital checkpoint not found: {args.digital_ckpt}")
 
-    # IMPORTANT: do NOT call analog_model.load_state_dict(...)
-    # Copy safely from digital model to analog model on CPU.
     initialize_analog_supernet_safe(digital_model, analog_model, verbose=True)
     print("Analog weight initialization finished successfully.", flush=True)
 
-    # Only now move models to device
     digital_model = digital_model.to(args.device)
     analog_model = analog_model.to(args.device)
     print(f"Digital and analog models moved to {args.device}", flush=True)
@@ -486,24 +561,32 @@ def main():
     # ------------------------
     # Search space
     # ------------------------
-    embed_choices = cfg.SEARCH_SPACE.EMBED_DIM
-    mlp_ratio_choices = cfg.SEARCH_SPACE.MLP_RATIO
-    num_heads_choices = cfg.SEARCH_SPACE.NUM_HEADS
-    depth_choices = cfg.SEARCH_SPACE.DEPTH
+    embed_choices = list(cfg.SEARCH_SPACE.EMBED_DIM)
+    mlp_ratio_choices = list(cfg.SEARCH_SPACE.MLP_RATIO)
+    num_heads_choices = list(cfg.SEARCH_SPACE.NUM_HEADS)
+    depth_choices = list(cfg.SEARCH_SPACE.DEPTH)
 
     L = max(depth_choices)
     change_qkv = args.change_qkv
 
+    print(f"embed_choices: {embed_choices}", flush=True)
+    print(f"mlp_ratio_choices: {mlp_ratio_choices}", flush=True)
+    print(f"num_heads_choices: {num_heads_choices}", flush=True)
+    print(f"depth_choices: {depth_choices}", flush=True)
+
     # ------------------------
-    # Fair sampler
+    # Fair sampler with DEPTH SAMPLING
     # ------------------------
     sampler = FairSampler(
-        L=L,
+        depth_choices=depth_choices,
         change_qkv=change_qkv,
         embed_choices=embed_choices,
         mlp_ratio_choices=mlp_ratio_choices,
         num_heads_choices=num_heads_choices
     )
+
+    print("\n--- Testing sampler fairness (depth counts over one cycle) ---", flush=True)
+    test_depth_fairness(sampler, verbose=True)
 
     print("\n--- Testing sampler fairness (short cycle) ---", flush=True)
     test_sampler_short(sampler, verbose=True)
@@ -516,7 +599,7 @@ def main():
 
     # Reset sampler after tests so training starts from a fresh cycle
     sampler = FairSampler(
-        L=L,
+        depth_choices=depth_choices,
         change_qkv=change_qkv,
         embed_choices=embed_choices,
         mlp_ratio_choices=mlp_ratio_choices,
@@ -547,6 +630,7 @@ def main():
 
     # ------------------------
     # Validation config
+    # NOTE: kept as full-config validation
     # ------------------------
     full_config = {
         "layer_num": L,
@@ -579,7 +663,7 @@ def main():
             flush=True
         )
 
-        # Validation
+        # Validation on full config
         analog_model.eval()
         analog_model.set_sample_config(full_config)
 
@@ -596,7 +680,7 @@ def main():
                 val_correct += predicted.eq(labels).sum().item()
 
         val_acc = 100.0 * val_correct / val_total
-        print(f"Validation Acc: {val_acc:.2f}%", flush=True)
+        print(f"Validation Acc (full config): {val_acc:.2f}%", flush=True)
 
         analog_model.train()
 

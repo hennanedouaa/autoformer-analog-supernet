@@ -1,7 +1,12 @@
 """
 supernet_engine.py
 
-Utilities for initializing an analog AutoFormer supernet from a digital one.
+Utilities for initializing an analog AutoFormer supernet from a digital one,
+plus a fair subnet sampler and one-epoch training helper.
+
+Modified version:
+- adds BALANCED DEPTH SAMPLING
+- returns sampled layer_num instead of forcing fixed max depth
 """
 
 import random
@@ -148,17 +153,22 @@ def initialize_analog_supernet(digital_model, analog_model, verbose=True):
 
 class FairSampler:
     """
-    Round-robin sampler that guarantees exact fairness over one cycle.
+    Fair round-robin sampler with balanced DEPTH sampling.
 
-    For each cycle:
-        - Embedding dimensions are shuffled and each repeated len(rh_combos) times.
-        - For each block and each embedding dimension, a shuffled permutation of
-          the available (r, h) combinations is created.
-        - Over a full cycle, each block sees every combination exactly once.
+    What is balanced over one cycle:
+    - each (depth, embed_dim) pair appears exactly len(rh_combos) times
+    - for each active block b < depth, and for each (depth, embed_dim) pair,
+      every (mlp_ratio, num_heads) combo appears exactly once over the cycle
+
+    Notes:
+    - max_L = max(depth_choices)
+    - blocks with index >= sampled depth are inactive and therefore ignored
+    - returned lists have length = sampled layer_num
     """
 
-    def __init__(self, L, change_qkv, embed_choices, mlp_ratio_choices, num_heads_choices):
-        self.L = L
+    def __init__(self, depth_choices, change_qkv, embed_choices, mlp_ratio_choices, num_heads_choices):
+        self.depth_choices = list(depth_choices)
+        self.max_L = max(self.depth_choices)
         self.change_qkv = change_qkv
         self.embed_choices = list(embed_choices)
 
@@ -172,61 +182,99 @@ class FairSampler:
 
     def _new_cycle(self):
         """
-        Create a fresh cycle with exact fairness.
-        Cycle length = len(embed_choices) * len(rh_combos)
+        Create a fresh cycle.
+
+        Cycle length:
+            len(depth_choices) * len(embed_choices) * len(rh_combos)
+
+        Construction:
+        - we create all (depth, embed_dim) pairs
+        - shuffle their order
+        - repeat each pair len(rh_combos) times
+        - for each active block b and each pair (L, d), assign a shuffled
+          permutation of rh_combos so every combo is used exactly once
         """
-        combos_per_d = len(self.rh_combos)
+        combos_per_pair = len(self.rh_combos)
 
-        d_order = self.embed_choices.copy()
-        random.shuffle(d_order)
+        depth_embed_pairs = [(L, d) for L in self.depth_choices for d in self.embed_choices]
+        random.shuffle(depth_embed_pairs)
 
-        self.d_cycle = []
-        for d in d_order:
-            self.d_cycle.extend([d] * combos_per_d)
+        self.depth_embed_cycle = []
+        for pair in depth_embed_pairs:
+            self.depth_embed_cycle.extend([pair] * combos_per_pair)
 
-        self.rh_cycles = []
-        for _ in range(self.L):
-            perms = {}
-            for d in self.embed_choices:
-                perm = self.rh_combos.copy()
-                random.shuffle(perm)
-                perms[d] = perm
+        # For each block index b in [0, max_L), we will build a cycle of RH choices.
+        # For inactive blocks (b >= sampled depth), the stored value is unused.
+        self.rh_cycles = [[] for _ in range(self.max_L)]
 
-            used_count = {d: 0 for d in self.embed_choices}
-            rh_cycle = []
+        # For every block and every (L, d) pair, create a shuffled permutation
+        # of rh_combos so active blocks see exact fairness over the cycle.
+        perms_by_block = []
+        for b in range(self.max_L):
+            per_pair = {}
+            for pair in depth_embed_pairs:
+                L, d = pair
+                if b < L:
+                    perm = self.rh_combos.copy()
+                    random.shuffle(perm)
+                    per_pair[pair] = perm
+            perms_by_block.append(per_pair)
 
-            for d in self.d_cycle:
-                idx = used_count[d]
-                rh_cycle.append(perms[d][idx])
-                used_count[d] += 1
+        # Track how many times we have already used each pair for each block.
+        used_count_by_block = []
+        for b in range(self.max_L):
+            counts = {}
+            for pair in depth_embed_pairs:
+                L, _ = pair
+                if b < L:
+                    counts[pair] = 0
+            used_count_by_block.append(counts)
 
-            self.rh_cycles.append(rh_cycle)
+        for pair in self.depth_embed_cycle:
+            L, _ = pair
+            for b in range(self.max_L):
+                if b < L:
+                    idx = used_count_by_block[b][pair]
+                    self.rh_cycles[b].append(perms_by_block[b][pair][idx])
+                    used_count_by_block[b][pair] += 1
+                else:
+                    self.rh_cycles[b].append(None)
 
         self.step = 0
 
     def sample_subnet(self):
         """
-        Return (embed_dim, mlp_ratio, num_heads) for the next batch.
+        Return:
+            layer_num, embed_dim, mlp_ratio, num_heads
+
+        where:
+            - layer_num is the sampled depth
+            - embed_dim has length layer_num
+            - mlp_ratio has length layer_num
+            - num_heads has length layer_num (or [] if change_qkv=False)
         """
-        d = self.d_cycle[self.step]
-        embed_dim = [d] * self.L
+        layer_num, d = self.depth_embed_cycle[self.step]
+
+        embed_dim = [d] * layer_num
         mlp_ratio = []
         num_heads = []
 
-        for b in range(self.L):
+        for b in range(layer_num):
+            choice = self.rh_cycles[b][self.step]
+
             if self.change_qkv:
-                r, h = self.rh_cycles[b][self.step]
+                r, h = choice
                 mlp_ratio.append(r)
                 num_heads.append(h)
             else:
-                r = self.rh_cycles[b][self.step][0]
+                r = choice[0]
                 mlp_ratio.append(r)
 
         self.step += 1
-        if self.step == len(self.d_cycle):
+        if self.step == len(self.depth_embed_cycle):
             self._new_cycle()
 
-        return embed_dim, mlp_ratio, num_heads
+        return layer_num, embed_dim, mlp_ratio, num_heads
 
 
 def train_one_epoch(
@@ -245,6 +293,9 @@ def train_one_epoch(
     correct = 0
     total = 0
 
+    # Optional stats so you can verify balanced depth exposure during training
+    depth_counts = {int(L): 0 for L in sampler.depth_choices}
+
     loop = tqdm(loader, desc="Training")
 
     for images, labels in loop:
@@ -252,12 +303,13 @@ def train_one_epoch(
         labels = labels.to(device, non_blocking=True)
 
         # -------------------------
-        # Sample subnet
+        # Sample subnet (NOW includes balanced depth)
         # -------------------------
-        embed_dim, mlp_ratio, num_heads = sampler.sample_subnet()
+        layer_num, embed_dim, mlp_ratio, num_heads = sampler.sample_subnet()
+        depth_counts[int(layer_num)] += 1
 
         config_dict = {
-            "layer_num": sampler.L,
+            "layer_num": layer_num,
             "embed_dim": embed_dim,
             "mlp_ratio": mlp_ratio,
         }
@@ -303,10 +355,13 @@ def train_one_epoch(
         loop.set_postfix(
             loss=float(loss.item()),
             acc=100.0 * correct / max(total, 1),
-            lr=optimizer.param_groups[0]["lr"]
+            lr=optimizer.param_groups[0]["lr"],
+            depth=layer_num
         )
 
     epoch_loss = running_loss / max(total, 1)
     epoch_acc = 100.0 * correct / max(total, 1)
+
+    print(f"Depth usage this epoch: {depth_counts}", flush=True)
 
     return epoch_loss, epoch_acc
