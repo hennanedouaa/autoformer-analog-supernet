@@ -1,7 +1,10 @@
 # analog_autoformer
 1-To create the envirement: 
 
+1-To create the envirement: 
 
+
+```buildoutcfg
 ```buildoutcfg
 conda env create -f environment.yaml
 conda activate analog-autoformer-supernet
@@ -20,4 +23,5 @@ python  training_script.py \
   --output_dir ./analog-ckpts \
   --gp --change_qkv --relative_position
 ```
+
 

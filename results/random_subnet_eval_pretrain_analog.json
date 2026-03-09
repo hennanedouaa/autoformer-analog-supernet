@@ -1,0 +1,129 @@
+{
+  "args": {
+    "cfg": "AutoFormer/experiments/supernet/supernet-T.yaml",
+    "digital_ckpt": "digital_ckpts/supernet-tiny.pth",
+    "analog_config": "Configs/analog-supernet-T.yaml",
+    "analog_ckpt": "",
+    "data_path": "/home/douaa/.cache/kagglehub/datasets/ifigotin/imagenetmini-1000/versions/1/imagenet-mini",
+    "num_samples": 1,
+    "batch_size": 64,
+    "num_workers": 4,
+    "input_size": 224,
+    "patch_size": 16,
+    "num_classes": 1000,
+    "drop": 0.0,
+    "attn_drop": 0.0,
+    "drop_path": 0.0,
+    "seed": 42,
+    "max_val_batches": 10,
+    "results_path": "./results/random_subnet_eval_pretrain_analog.json",
+    "gp": true,
+    "relative_position": true,
+    "change_qkv": true,
+    "no_abs_pos": false,
+    "max_relative_position": 14,
+    "amp": false
+  },
+  "summary": {
+    "num_samples": 1,
+    "digital_subnet": {
+      "loss": 0.9151458233594895,
+      "top1": 79.21875,
+      "top5": 94.21875
+    },
+    "analog_subnet": {
+      "loss": 5.869809627532959,
+      "top1": 10.0,
+      "top5": 25.3125
+    },
+    "standalone_analog": {
+      "loss": 5.886388540267944,
+      "top1": 11.09375,
+      "top5": 23.75
+    },
+    "avg_gaps_top1": {
+      "digital_vs_analog_subnet": 69.21875,
+      "digital_vs_standalone_analog": 68.125,
+      "analog_subnet_vs_standalone_analog": 1.09375
+    }
+  },
+  "results": [
+    {
+      "sample_index": 1,
+      "subnet_cfg": {
+        "mlp_ratio": [
+          3.5,
+          3.5,
+          4,
+          3.5,
+          3.5,
+          3.5,
+          3.5,
+          3.5,
+          4,
+          3.5,
+          3.5,
+          3.5,
+          3.5,
+          3.5
+        ],
+        "num_heads": [
+          3,
+          3,
+          4,
+          3,
+          4,
+          4,
+          3,
+          3,
+          4,
+          4,
+          4,
+          3,
+          3,
+          4
+        ],
+        "embed_dim": [
+          192,
+          192,
+          192,
+          192,
+          192,
+          192,
+          192,
+          192,
+          192,
+          192,
+          192,
+          192,
+          192,
+          192
+        ],
+        "layer_num": 14
+      },
+      "digital_subnet": {
+        "loss": 0.9151458233594895,
+        "top1": 79.21875,
+        "top5": 94.21875,
+        "n": 640
+      },
+      "analog_subnet": {
+        "loss": 5.869809627532959,
+        "top1": 10.0,
+        "top5": 25.3125,
+        "n": 640
+      },
+      "standalone_analog": {
+        "loss": 5.886388540267944,
+        "top1": 11.09375,
+        "top5": 23.75,
+        "n": 640
+      },
+      "gaps_top1": {
+        "digital_vs_analog_subnet": 69.21875,
+        "digital_vs_standalone_analog": 68.125,
+        "analog_subnet_vs_standalone_analog": 1.09375
+      }
+    }
+  ]
+}
