@@ -1,7 +1,10 @@
 # ----------------------------------------------------------------------
 # Full Hardware-Aware Fine-Tuning Script with Fair Sampling
 # Safe analog initialization version
-# Modified to support BALANCED DEPTH SAMPLING
+# Modified to support:
+#   - BALANCED DEPTH SAMPLING
+#   - VALIDATION on a fixed subnet pool loaded from JSON
+#   - CHECKPOINT saving every 10 epochs starting from epoch 50
 # ----------------------------------------------------------------------
 """
 To execute it:
@@ -10,6 +13,7 @@ python training_script.py \
     --cfg AutoFormer/experiments/supernet/supernet-T.yaml \
     --digital-ckpt digital_ckpts/supernet-tiny.pth \
     --analog-config configs/analog-supernet-T.yaml \
+    --validation-pool validation_pool_T.json \
     --data-path /home/douaa/.cache/kagglehub/datasets/ifigotin/imagenetmini-1000/versions/1/imagenet-mini \
     --batch-size 64 \
     --epochs 100 \
@@ -18,6 +22,7 @@ python training_script.py \
 """
 
 import inspect
+import json
 import random
 from pathlib import Path
 
@@ -191,6 +196,102 @@ def initialize_analog_supernet_safe(digital_model, analog_model, verbose=True):
         log("=" * 60)
 
 
+def load_validation_pool(path):
+    with open(path, "r") as f:
+        pool = json.load(f)
+
+    # light sanity checks
+    required_keys = {"layer_num", "embed_dim", "mlp_ratio", "num_heads"}
+    for i, cfg_dict in enumerate(pool):
+        missing = required_keys - set(cfg_dict.keys())
+        if missing:
+            raise ValueError(f"Validation pool config #{i} is missing keys: {missing}")
+
+        depth = cfg_dict["layer_num"]
+        if not (
+            len(cfg_dict["embed_dim"]) == depth
+            and len(cfg_dict["mlp_ratio"]) == depth
+            and len(cfg_dict["num_heads"]) == depth
+        ):
+            raise ValueError(
+                f"Validation pool config #{i} has inconsistent lengths with layer_num={depth}"
+            )
+
+    return pool
+
+
+@torch.no_grad()
+def evaluate_validation_pool(model, val_loader, validation_pool, device):
+    """
+    Evaluate mean top-1 accuracy across a fixed pool of subnet configs.
+    """
+    model.eval()
+
+    per_subnet_results = []
+
+    for idx, subnet_cfg in enumerate(validation_pool):
+        model.set_sample_config(subnet_cfg)
+
+        correct = 0
+        total = 0
+
+        for images, labels in val_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            outputs = model(images)
+            _, predicted = outputs.max(1)
+
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+
+        top1 = 100.0 * correct / total
+        per_subnet_results.append(
+            {
+                "index": idx,
+                "top1": top1,
+                "subnet_cfg": subnet_cfg,
+            }
+        )
+
+    mean_top1 = sum(x["top1"] for x in per_subnet_results) / len(per_subnet_results)
+
+    # grouped metrics
+    depth_scores = {}
+    embed_scores = {}
+
+    for item in per_subnet_results:
+        cfg_dict = item["subnet_cfg"]
+        depth = cfg_dict["layer_num"]
+        embed = cfg_dict["embed_dim"][0]
+
+        depth_scores.setdefault(depth, []).append(item["top1"])
+        embed_scores.setdefault(embed, []).append(item["top1"])
+
+    mean_by_depth = {
+        int(k): sum(v) / len(v) for k, v in sorted(depth_scores.items())
+    }
+    mean_by_embed = {
+        int(k): sum(v) / len(v) for k, v in sorted(embed_scores.items())
+    }
+
+    return {
+        "mean_top1": mean_top1,
+        "mean_by_depth": mean_by_depth,
+        "mean_by_embed": mean_by_embed,
+        "per_subnet_results": per_subnet_results,
+    }
+
+
+def save_checkpoint(model, output_dir, epoch):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    ckpt_path = output_dir / f"analog_supernet_epoch_{epoch}.pth"
+    torch.save(model.state_dict(), ckpt_path)
+    print(f"Saved checkpoint: {ckpt_path}", flush=True)
+
+
 # ----------------------------------------------------------------------
 # Fairness tests adapted for BALANCED DEPTH SAMPLING
 # ----------------------------------------------------------------------
@@ -230,12 +331,6 @@ def test_operator_counts(sampler, verbose=True):
     """
     Simulate one full cycle and count how many times each operator
     (fc1, fc2, qkv, proj) is used in each ACTIVE block.
-
-    Important:
-    - fc1/fc2 keys collapse over head choice, so their expected count is
-      active_depth_count * num_head_choices
-    - qkv/proj keys collapse over mlp ratio choice, so their expected count is
-      active_depth_count * num_mlp_ratio_choices
     """
     cycle_len = len(sampler.depth_embed_cycle)
 
@@ -360,14 +455,6 @@ def test_sampler_short(sampler, verbose=True):
 def test_sampler_long(sampler, num_steps=10000, tolerance=0.05, verbose=True):
     """
     Long-run approximate fairness test.
-
-    For each active block b, we count keys:
-        (depth, embed_dim, mlp_ratio, num_heads)
-    among configs where block b is active.
-
-    Since each active key appears once per full global cycle,
-    the expected count is:
-        num_steps / len(sampler.depth_embed_cycle)
     """
     counts = {b: {} for b in range(sampler.max_L)}
     all_ok = True
@@ -444,6 +531,12 @@ def main():
         type=str,
         required=True,
         help='Path to analog supernet YAML'
+    )
+    parser.add_argument(
+        '--validation-pool',
+        type=str,
+        required=True,
+        help='Path to JSON file containing the validation subnet pool.'
     )
     args = parser.parse_args()
 
@@ -559,6 +652,12 @@ def main():
     print(f"Train samples: {len(dataset_train)}, Val samples: {len(dataset_val)}", flush=True)
 
     # ------------------------
+    # Load validation pool
+    # ------------------------
+    validation_pool = load_validation_pool(args.validation_pool)
+    print(f"Loaded validation pool with {len(validation_pool)} subnet configs from {args.validation_pool}", flush=True)
+
+    # ------------------------
     # Search space
     # ------------------------
     embed_choices = list(cfg.SEARCH_SPACE.EMBED_DIM)
@@ -566,7 +665,6 @@ def main():
     num_heads_choices = list(cfg.SEARCH_SPACE.NUM_HEADS)
     depth_choices = list(cfg.SEARCH_SPACE.DEPTH)
 
-    L = max(depth_choices)
     change_qkv = args.change_qkv
 
     print(f"embed_choices: {embed_choices}", flush=True)
@@ -629,18 +727,6 @@ def main():
     )
 
     # ------------------------
-    # Validation config
-    # NOTE: kept as full-config validation
-    # ------------------------
-    full_config = {
-        "layer_num": L,
-        "embed_dim": [cfg.SUPERNET.EMBED_DIM] * L,
-        "mlp_ratio": [cfg.SUPERNET.MLP_RATIO] * L,
-    }
-    if change_qkv:
-        full_config["num_heads"] = [cfg.SUPERNET.NUM_HEADS] * L
-
-    # ------------------------
     # Training loop
     # ------------------------
     print("\nStarting hardware-aware fine-tuning...", flush=True)
@@ -663,33 +749,35 @@ def main():
             flush=True
         )
 
-        # Validation on full config
-        analog_model.eval()
-        analog_model.set_sample_config(full_config)
+        # ------------------------
+        # Validation on subnet pool
+        # ------------------------
+        val_stats = evaluate_validation_pool(
+            analog_model,
+            val_loader,
+            validation_pool,
+            args.device,
+        )
 
-        val_correct, val_total = 0, 0
-        with torch.no_grad():
-            for images, labels in val_loader:
-                images = images.to(args.device)
-                labels = labels.to(args.device)
-
-                outputs = analog_model(images)
-                _, predicted = outputs.max(1)
-
-                val_total += labels.size(0)
-                val_correct += predicted.eq(labels).sum().item()
-
-        val_acc = 100.0 * val_correct / val_total
-        print(f"Validation Acc (full config): {val_acc:.2f}%", flush=True)
+        print(f"Validation Mean Top1 (pool): {val_stats['mean_top1']:.2f}%", flush=True)
+        print(f"Validation Mean Top1 by depth: {val_stats['mean_by_depth']}", flush=True)
+        print(f"Validation Mean Top1 by embed: {val_stats['mean_by_embed']}", flush=True)
 
         analog_model.train()
 
+        # ------------------------
+        # Save checkpoint every 10 epochs starting from epoch 50
+        # ------------------------
+        current_epoch = epoch + 1
+        if current_epoch >= 50 and current_epoch % 10 == 0:
+            save_checkpoint(analog_model, args.output_dir, current_epoch)
+
     # ------------------------
-    # Save fine-tuned model
+    # Save final fine-tuned model
     # ------------------------
-    save_path = Path(args.output_dir) / "analog_supernet_finetuned.pth"
-    torch.save(analog_model.state_dict(), save_path)
-    print(f"Fine-tuning finished. Model saved to {save_path}", flush=True)
+    final_path = Path(args.output_dir) / "analog_supernet_finetuned.pth"
+    torch.save(analog_model.state_dict(), final_path)
+    print(f"Fine-tuning finished. Model saved to {final_path}", flush=True)
 
 
 if __name__ == "__main__":
